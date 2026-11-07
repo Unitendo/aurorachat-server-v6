@@ -1,12 +1,11 @@
-<!-- Aurorachat Web Client -->
-<!-- v6 dev version, currently WIP -->
+<!-- Chatterbox Web Client -->
 
 <html>
   <head>
-    <meta property="og:title" content="AuC v6 Web Client">
-    <meta property="og:description" content="Web client for Aurorachat v6">
-    <meta property="og:image" content="https://github.com/Unitendo/aurorachat-3ds/blob/main/meta/banner.png?raw=true">
-    <title>AuC v6 Web Client</title>
+    <meta property="og:title" content="Chatterbox Web">
+    <meta property="og:description" content="Web client for Chatterbox">
+    <meta property="og:image" content="https://github.com/Orstando/chatterbox/blob/main/web/img/share-logo.png?raw=true">
+    <title>Chatterbox Web</title>
 
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
@@ -93,6 +92,7 @@
         padding-right: 10px;
         float: right;
         align-items: center;
+        color: rgba(255, 255, 255, 0.473);
       }
       .nav-roomStatus img {
         width: 16px;
@@ -102,6 +102,7 @@
       }
       .nav-roomStatus-desc {
         padding-right: 5px;
+        font-size: smaller;
       }
 
       /* Buttons */
@@ -143,6 +144,7 @@
       .error-msg {
         color: red;
       }
+
       .dropdown {
         border: 2px solid #ccc;
         border-radius: 15px;
@@ -287,10 +289,68 @@
       .info-btn {
         margin-bottom: 5px;
       }
+      
+      /* Toggle switch */
+      .switch {
+        position: relative;
+        display: inline-block;
+        width: 60px;
+        height: 34px;
+      }
 
-      #page-options {
-        padding: 20% 0;
-        text-align: center;
+      .switch input {
+        opacity: 0;
+        width: 0;
+        height: 0;
+      }
+
+      .slider {
+        position: absolute;
+        cursor: pointer;
+        top: 0;
+        left: 0;
+        right: 0;
+        bottom: 0;
+        background-color: #ccc;
+        -webkit-transition: .4s;
+        transition: .4s;
+        border-radius: 34px;
+      }
+
+      .slider:before {
+        position: absolute;
+        content: "";
+        height: 26px;
+        width: 26px;
+        left: 4px;
+        bottom: 4px;
+        background-color: white;
+        -webkit-transition: .4s;
+        transition: .4s;
+        border-radius: 50%;
+      }
+
+      input:checked + .slider {
+        background-color: #2196F3;
+      }
+
+      input:focus + .slider {
+        box-shadow: 0 0 1px #2196F3;
+      }
+
+      input:checked + .slider:before {
+        -webkit-transform: translateX(26px);
+        -ms-transform: translateX(26px);
+        transform: translateX(26px);
+      }
+
+      .darkmode {
+        display: flex;
+        align-items: center;
+        padding-left: 5px;
+      }
+      .darkmode span {
+        padding-left: 10px;
       }
 
       .hidden { /* should always stay at the bottom here */
@@ -334,20 +394,20 @@
         </a>
       </li>
       <!-- css "float:right;" makes this a bit confusing, sorry -->
-      <p class="nav-roomStatus"><p class="nav-roomStatus nav-roomStatus-desc">Currently in room:</p>
+      <p class="nav-roomStatus roboto-font"></p><p class="nav-roomStatus nav-roomStatus-desc roboto-font"></p>
     </ul>
     </div>
 
     <!-- Main Menu -->
     <div id="page-mainmenu">
-      <br><h1 class="roboto-font inline-header">Aurorachat</h1><br><br>
+      <br><h1 class="roboto-font inline-header">Chatterbox</h1><br><br>
       <button class="btn btn-primary" onclick="gotoPage('signin')">Sign In</button>
       <button class="btn btn-primary" onclick="gotoPage('signup')">Sign Up</button>
     </div>
 
     <!-- Sign In -->
     <div class="hidden" id="page-signin">
-      <br><h1 class="roboto-font inline-header">Aurorachat</h1>
+      <br><h1 class="roboto-font inline-header">Chatterbox</h1>
       <span class="roboto-font">Sign In</span><br><br>
       <input class="textbox" maxlength="30" placeholder="Username" id="signin-username"><br>
       <input type="password" class="textbox" placeholder="Password" id="signin-password"><br><br>
@@ -358,7 +418,7 @@
 
     <!-- Sign Up -->
     <div class="hidden" id="page-signup">
-      <br><h1 class="roboto-font inline-header">Aurorachat</h1>
+      <br><h1 class="roboto-font inline-header">Chatterbox</h1>
       <span class="roboto-font">Sign Up</span><br><br>
       <input class="textbox" maxlength="30" placeholder="Username" id="signup-username"><br>
       <input type="password" class="textbox" placeholder="Password" id="signup-password"><br><br>
@@ -379,7 +439,7 @@
 
     <!-- Rooms -->
     <div class="hidden" id="page-rooms">
-      <br><h1 class="roboto-font inline-header">Aurorachat</h1>
+      <br><h1 class="roboto-font inline-header">Chatterbox</h1>
       <span class="roboto-font">Rooms</span><br><br>
       <div class="rooms">
       </div>
@@ -387,7 +447,7 @@
 
     <!-- Info -->
     <div class="hidden" id="page-info">
-      <br><h1 class="roboto-font inline-header">Aurorachat</h1>
+      <br><h1 class="roboto-font inline-header">Chatterbox</h1>
       <span class="roboto-font">Info</span><br><br>
       <div class="info">
         <button class="btn btn-primary info-btn" onclick="showInfo('Rules');">Rules</button><br>
@@ -398,17 +458,24 @@
 
     <!-- Options -->
     <div class="hidden" id="page-options">
-      The options page is currently unfinished, check back later
+      <br><h1 class="roboto-font inline-header">Chatterbox</h1>
+      <span class="roboto-font">Options</span><br><br>
+      <div class="darkmode">
+        <label class="switch">
+          <input type="checkbox">
+          <span class="slider round"></span>
+        </label>
+        <span class="roboto-font">Dark Mode</span>
+      </div>
     </div>
 
     <script src="connection.js"></script>
     <script>
       const EXPIRY_DATE_MS = 3600000; // expiry date for login token (1 hour)
       // server info
-      const url = "104.236.25.60";
-      const http_port = 6767;
-      const wss_port = 3034;
-      
+      const url = "127.0.0.1:3035";
+      const is_secure = false;
+
       function isNavEnabled(button) {
         console.log("Checking navbar enabled state for: ", button);
         if (button == "all") {
@@ -433,7 +500,7 @@
       function navBtn(btn) {
         console.log("Navbar: button '", btn, "' clicked");
         if (isNavEnabled(btn) && isNavEnabled("all")) {
-          gotoPage(btn)
+          gotoPage(btn);
         }
       }
       
@@ -632,12 +699,25 @@
           signup();
         }
       });
-      
-      var client = new Client("AuC-WebClient", url, http_port, wss_port);
 
-      client.onMessage = function(data) {
+      // https://stackoverflow.com/a/18837818
+      async function doesImgExist(imageSrc) {
+        return new Promise((resolve) => {
+          const img = new Image();
+          img.onload = () => resolve(true);
+          img.onerror = () => resolve(false);
+          img.src = imageSrc;
+        });
+      }
+      async function getPlatformImage(platform) {
+        return (await doesImgExist("img/plt/"+platform+".png") ? "img/plt/"+platform+".png" : "img/plt/Unknown.png")
+      }
+      var client = new Client("ChB-WebClient", url, is_secure);
+
+      client.onMessage = async function(data) {
+        console.log("recieved", data)
         if (data.room == currentRoom[0]) {
-          appendMsg(data.pfp, data.username, data.message, data.platform, data.image);
+          appendMsg(data.author.pfp, data.author.name, data.content, (await getPlatformImage(data.platform)), data.image);
         };
       }
       client.onError = function(error) {
@@ -691,9 +771,9 @@
         }
         data = await client.login(username, password);
         console.log(data)
-        switch(data) {
-          case "ERR_BANNED":
-            showErr("signin", "Error: You are banned.");
+        switch(data.error) {
+          case "Banned":
+            showErr("signin", "Error: You are banned.\nReason: "+data.reason);
             return;
           case "ERR_INVALID_TOKEN":
             showErr("signin", "Error: Token invalid, please reload the page.");
@@ -701,12 +781,14 @@
           case "ERR_WHAT_THE_HECK":
             showErr("signin", "An unknown error occurred.");
             return;
-          case "ERR_WRONG_PASS":
-            showErr("signin", "Error: Incorrect password.");
+          case "Incorrect username or password":
+            showErr("signin", "Error: Incorrect username or password.");
             return;
         }
-        handleToken(data.split("|")[0]);
+        handleToken(data.token);
         toggleNav("all"); // enable nav
+        getRooms();
+        enterRoom("general", "https://placehold.co/64?text=g")
         gotoPage("chat");
       }
       
@@ -720,7 +802,7 @@
           return;
         }
         data = await client.signup(username, password)
-        switch(data) {
+        switch(data.error) {
           case "ERR_BANNED":
             showErr("signup", "Error: You are banned.");
             return;
@@ -737,8 +819,10 @@
             showErr("signup", "Error: Account already in use.");
             return;
         }
-        handleToken(data.split("|")[0]);
+        handleToken(data.token);
         toggleNav("all"); // enable nav
+        getRooms();
+        enterRoom("general", "https://placehold.co/64?text=g")
         gotoPage("chat");
       }
       currentRoom = null;
@@ -754,36 +838,44 @@
         imgEl.src = img
         document.getElementsByClassName("nav-roomStatus")[0].replaceChildren()
         document.getElementsByClassName("nav-roomStatus")[0].append(imgEl, "#"+name)
+        document.getElementsByClassName("nav-roomStatus-desc")[0].innerText = "Currently in room:"
       }
       function enterRoom(name, img) {
         setRoomStatus(name, img);
         currentRoom = [name, img];
         // hacky fix to keep messages at bottom on start
         document.getElementById("messages").replaceChildren();
-        const hackyFixDivs = new Array(30).fill(document.createElement("div")); // ah yes, "hackyFixDivs"
+        const hackyFixDivs = new Array(45).fill(document.createElement("div")); // ah yes, "hackyFixDivs"
         hackyFixDivs.forEach(hackyFixDiv => {
           hackyFixDiv.classList.add("message");
           hackyFixBr = document.createElement("br");
           hackyFixDiv.appendChild(hackyFixBr);
           document.getElementById("messages").appendChild(hackyFixDiv);
         });
+        getHistory();
       }
       async function getRooms() {
         data = await client.rooms(token);
-        data["rooms"].forEach(async (item) => {
+        data.forEach(async (item) => {
           online = await client.online(token, item[0]);
           appendRoom("https://placehold.co/64?text="+item[0], item, online)
         })
         return data;
       }
+      async function getHistory() {
+        messages = await client.history(token, currentRoom[0]);
+        for (const message of messages) {
+          appendMsg(message.author.pfp, message.author.name, message.content, (await getPlatformImage(message.platform)), message.image);
+        }
+      }
+
       if (!handleToken()) { // disable nav if not signed in
         toggleNav("all");
       } else {
+        getRooms();
+        enterRoom("general", "https://placehold.co/64?text=g")
         gotoPage("chat");
       }
-      getRooms();
-      enterRoom("general", "https://placehold.co/64?text=g")
     </script>
   </body>
 </html>
-

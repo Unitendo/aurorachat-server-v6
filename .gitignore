@@ -1,59 +1,19 @@
-# --- Environment / Secrets ---
 .env
 .env.*
 *.env
-
-# --- Node modules ---
 node_modules/
-
-# --- Python cache ---
-**pycache**/
-*.py[cod]
-*$py.class
-
-# --- Virtual environments ---
-venv/
-.venv/
-env/
-ENV/
-
-# --- Database files ---
 *.db
-*.sqlite
-*.sqlite3
 users.json
-
-# --- Server Configuration ---
 config.js
-
-# --- Logs ---
 *.log
-
-# --- OS files ---
 .DS_Store
 Thumbs.db
-
-# --- Editor / IDE ---
 .vscode/
 .idea/
 *.swp
 *.swo
-
-# --- Flask / session ---
-instance/
-*.pid
-
-# --- Build / dist ---
-build/
-dist/
-*.egg-info/
-
-# --- Coverage / testing ---
-.coverage
-htmlcov/
-.pytest_cache/
-
-# --- Misc ---
 *.bak
 *.tmp
-maintenanceMode_Active.conf
+package-lock.json
+data/users.json
+config.js

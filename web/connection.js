@@ -1,23 +1,17 @@
 class Client {
-  constructor(useragent, url, httpport, socketport) {
-    this.ua = useragent || "AuC-WebLib";
-    this.url = url ? "http://"+url+':'+httpport : ''; // if url is empty, use current server ip/port (as in, the server that this web client is on)
-    this.ws = new WebSocket('ws://'+url+':'+socketport);
+  constructor(useragent, url, is_secure) {
+    this.ua = useragent || "ChB-WebLib";
+    var http_prefix = is_secure ? "https://" : "http://"
+    var ws_prefix = is_secure ? "wss://" : "ws://"
+    this.url = url ? http_prefix+url : ''; // if url is empty, use current server ip/port (as in, the server that this web client is on)
+    this.ws = new WebSocket(ws_prefix+url);
     this.ws.onopen = function() {
       console.log('Connected via WebSocket');
     }
     this.ws.onmessage = (event) => {
-      var data = event.data.split("|").slice(0, -2);
-      var result = {}
-      result["username"] = data[0];
-      result["message"] = data.slice(1,-1).join("|"); // allow for messages with pipes in them
-      result["room"] = data.slice(-1,).join("|");
-      result["pfp"] = "img/pfp.png"; // placeholder
-      result["platform"] = "img/plt/web.png"; // placeholder
-      console.log(!!this.onMessage)
-      console.log(result)
+      var data = JSON.parse(event.data)
       if (this.onMessage) { // check if callback has been created yet
-        this.onMessage(result);
+        this.onMessage(data);
       };
     }
     this.ws.onerror = (err) => {
@@ -35,66 +29,59 @@ class Client {
     const response = await fetch(this.url+"/api/signup", {
       method: 'POST',
       headers: {
-        'Content-Type': 'text/plain',
+        'Content-Type': 'application/json',
         'User-Agent': this.ua
       },
-      body: [username,password,,].join("|")
+      body: JSON.stringify({"username": username, "password": password})
     })
-    const data = await response.text();
+    const data = await response.json();
     return data;
   }
   async login(username, password) {
     const response = await fetch(this.url+"/api/login", {
         method: 'POST',
         headers: {
-          'Content-Type': 'text/plain',
+          'Content-Type': 'application/json',
           'User-Agent': this.ua
         },
-        body: [username,password,,].join("|")
+        body: JSON.stringify({"username": username, "password": password})
     })
-    const data = await response.text();
+    const data = await response.json();
     console.log(data)
-    return data
+    return data;
   }
   async send(token, msg, room, platform, img) {
     if (!platform) {platform="Web"}
     const response = await fetch(this.url+"/api/chat", {
         method: 'POST',
         headers: {
-          'Content-Type': 'text/plain',
+          'Content-Type': 'application/json',
           'User-Agent': this.ua,
-          'auth': token
+          'Authorization': token
         },
-        body: [msg,room,,].join('|')
+        body: JSON.stringify({"room": room, "content": msg, "platform": platform, "image": img})
     })
-    const data = await response.text();
+    const data = await response.json();
     return data;
   }
   async test() {
     const response = await fetch(this.url+"/api/test", {
         method: 'GET'
     })
-    const data = await response.text();
-    return data;
+    const data = await response.json();
+    return data.result;
   }
   async rooms(token) {
     const response = await fetch(this.url+"/api/rooms", {
-        method: 'POST',
+        method: 'GET',
         headers: {
           'Content-Type': 'text/plain',
           'User-Agent': this.ua,
-          'auth': token
+          'Authorization': token
         }
     })
-    const data = await response.text();
-    const asList = data.split("|");
-    const roomCount = parseInt(asList[0])
-    const rooms = asList.slice(1, -1)
-    return {
-        "count": roomCount,
-        "rooms": rooms
-    };
-    console.log(data)
+    const data = await response.json();
+    return data
   }
   async info(token, infotype) {
     const response = await fetch(this.url+"/api/"+infotype, {
@@ -102,23 +89,46 @@ class Client {
       headers: {
         'Content-Type': 'text/plain',
         'User-Agent': this.ua,
-        'auth': token
+        'Authorization': token
       }
     })
     const data = await response.text();
     return data;
   }
   async online(token, room) {
-    const response = await fetch(this.url+"/api/online", {
-      method: 'POST',
+    const url = this.url+"/api/online?"+new URLSearchParams({room: room});
+    const response = await fetch(url, {
+      method: 'GET',
       headers: {
-        'Content-Type': 'text/plain',
         'User-Agent': this.ua,
-        'auth': token
-      },
-      body: room
+        'Authorization': token
+      }
     })
-    const data = await response.text();
-    return data;
+    const data = await response.json();
+    return data.count;
+  }
+  async history(token, room) {
+    const url = this.url+"/api/history?"+new URLSearchParams({room: room});
+    const response = await fetch(url, {
+      method: 'GET',
+      headers: {
+        'User-Agent': this.ua,
+        'Authorization': token
+      }
+    })
+    const data = await response.json();
+    return data
+  }
+  async isAdmin(token, username) {
+    const url = this.url+"/api/isadmin?"+new URLSearchParams({username: username});
+    const response = await fetch(url, {
+      method: 'GET',
+      headers: {
+        'User-Agent': this.ua,
+        'Authorization': token
+      }
+    })
+    const data = await response.json();
+    return data.result
   }
 }
