@@ -1,34 +1,42 @@
 {
-  "name": "aurorachat-server",
+  "name": "chatterbox",
   "version": "1.0.0",
-  "description": "AUCv6 server.",
-  "homepage": "https://github.com/Unitendo/aurorachat-server#readme",
+  "description": "Chatterbox",
+  "homepage": "https://github.com/Orstando/chatterbox",
   "bugs": {
-    "url": "https://github.com/Unitendo/aurorachat-server/issues"
+    "url": "https://github.com/Orstando/chatterbox/issues"
   },
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/Unitendo/aurorachat-server.git"
+    "url": "git+https://github.com/Orstando/chatterbox.git"
   },
-  "license": "POL",
-  "author": "Startendo team",
+  "license": "GPL",
+  "author": "Orstando",
   "type": "commonjs",
   "main": "server.js",
   "scripts": {
     "test": "echo \"Error: no test specified\" && exit 1",
-    "start": "node server.js",
+    "start": "node .",
     "dev": "npx nodemon"
   },
   "dependencies": {
     "bcryptjs": "^3.0.3",
+    "cors": "^2.8.6",
+    "discord.js": "^14.27.0",
+    "ejs": "^6.0.1",
     "express": "^5.2.1",
     "express-session": "^1.19.0",
+    "express-ws": "^5.0.2",
+    "globby": "^16.2.3",
     "jsonwebtoken": "^9.0.3",
-    "ws": "^8.21.3",
     "obscenity": "^0.4.6",
-    "cors": "^2.8.6"
+    "sqlite3": "^6.0.1",
+    "ws": "^8.21.1"
   },
   "nodemonConfig": {
     "ignore": "users.json"
+  },
+  "allowScripts": {
+    "sqlite3@6.0.1": true
   }
 }

@@ -1,24 +1,24 @@
-<h1 align="center">Welcome to the aurorachat repository </h1>
-This is the server for Aurorachat.<br>
-For clients and stuff, see the <a href="https://github.com/Unitendo/aurorachat">main repo</a>.
-The license, code of conduct, and security/contributing guidelines in the main repo also apply here.
-
-<br>This repository is **open** for contributions! If you'd like to, you may open a PR or an issue, contributing helps us as we develop aurorachat!
+<h1 align="center">Welcome to the chatterbox repository </h1>
+<div align="center">
+  <a href="https://chatterbox.orstando.com">Public instance</a><br>
+  <a href="https://discord.gg/P9G7vRRgBV">Discord server</a>
+</div>
+<br>This repository is **open** for contributions! If you'd like to, you may open a PR or an issue, contributing helps us as we develop chatterbox!
 
 ## How to Run the Server ##
 
-### Running AUC v6 ###
+### Running Chatterbox ###
 
 ```bash
-git clone https://github.com/Unitendo/aurorachat-server.git
-cd aurorachat-server
+git clone https://github.com/Orstando/chatterbox.git
+cd chatterbox
 
 # Install dependencies
-npm install express express-session bcryptjs jsonwebtoken
+npm i
 
 # Setup server configuration
 cp config.example.js config.js
 # Now would be a great time to edit config.js
 
-node server.js
+node .
 ```

@@ -1,1231 +1,373 @@
-const config = require('./config') // .env but shittier (tm)
-const express = require('express'); // express, used for webserver actions
-const net = require('net'); // net, used for socket functions
-const session = require('express-session'); // express-session, used for the admin panel
-const bcrypt = require('bcryptjs'); // BCrypt, used for hashing passwords
-const jwt = require('jsonwebtoken'); // JSON Web Token, used for authentication instead of manually using IPs (stupid behavior)
-const path = require('path'); // Wait, what?
-const fs = require('fs'); // Filesystem actions
-const websocket = require('ws'); // WebSocket server, for the web client
-const cors = require('cors'); //Kill all CORS users.
-const { RegExpMatcher, TextCensor, englishDataset, englishRecommendedTransformers } = require('obscenity'); // Please read the channel description.
-const { 
-  TOKEN_SECRET, SESSION_SECRET,
-  HTTP_PORT, SOCKET_PORT, WEBSOCKET_PORT
-} = config
+const express = require('express');
+const session = require('express-session');
+const bcrypt = require('bcryptjs');
+const jwt = require('jsonwebtoken');
+const websocket = require('ws');
+const cors = require('cors');
+const path = require('path');
+const fs = require('fs');
+const { globbySync } = require('globby');
+
+const censor = require('./censor');
+const admin = require("./admin");
+const { UserDatabase, MessageDatabase } = require("./db");
+const config = require('./config');
+
+const { send } = require('process');
+
+// Plugin handling
+const plugins = [];
+
+class PluginUtility {
+  constructor(pluginName, config) {
+    this.pconf = config.plugin_config[pluginName];
+    this.gconf = config;
+  }
+  sendChatMessage(data) {
+    if (chatHistory[data.room]) {
+      chatHistory[data.room].push(data);
+
+      // drop the oldest message if we exceed it
+      if (chatHistory[data.room].length > config.history_limit) {
+        chatHistory[data.room].splice(0, chatHistory[data.room].length - config.history_limit)
+      }
+    }
+    console.log("sent", JSON.stringify(data))
+    ws_server.clients.forEach(client => {
+      client.send(JSON.stringify(data));
+    });
+  }
+}
+const pluginFileNames = globbySync("./plugins/*.js");
+pluginFileNames.forEach(filename => {
+  const pluginName = filename.match("(plugins/)(.*)(?=\.js)")[2]
+  const pluginInit = require("./plugins/"+pluginName);
+  const pluginUtility = new PluginUtility(pluginName, config)
+  const pluginOnMsg = pluginInit(pluginUtility);
+  plugins.push(pluginOnMsg)
+});
+
+function sendPluginData(data) {
+  plugins.forEach(pluginOnMsg => {
+    pluginOnMsg(data);
+  })
+}
+
+const userdb = new UserDatabase();
+
 const userMessageTimes = {};
 const userRecentMessages = {};
-const userLastMessageTime = {}; // Per-user cooldown tracking
-const COOLDOWN_MS = 5000; // 5 second cooldown between messages
-const app = express(); // Create the actual server (the express one anyway)
-app.use(express.text()); // Make sure to accept raw text because JSON parsing in base C is hell
+const app = express(); // Create the http server
+app.use(express.json());
 app.use(cors({
   origin: '*',
   methods: ['GET', 'POST', 'PUT', 'DELETE', 'PATCH', 'OPTIONS'],
-  allowedHeaders: ['Content-Type', 'Authorization', 'auth'] // Make sure your custom 'auth' header is whitelisted!
+  allowedHeaders: ['Content-Type', 'Authorization', 'User-Agent']
 }));
-const USERS_FILE = path.join(__dirname, 'users.json');
 
-// Read the users file
-function readUsers() {
-  try {
-    if (!fs.existsSync(USERS_FILE)) {
-      return { users: [], admins: [], bannedIps: [] };
-    }
-    const data = fs.readFileSync(USERS_FILE);
-    const parsed = JSON.parse(data);
-    // Backwards compatible w/ old users.json files that predate IP bans
-    if (!parsed.bannedIps) parsed.bannedIps = [];
-    return parsed;
-  } catch (err) {
-    console.error("Failed to read users.json:", err);
-    return { users: [], admins: [], bannedIps: [] };
-  }
-}
-
-// Write to the users file
-function writeUsers(data) {
-  fs.writeFileSync(USERS_FILE, JSON.stringify(data, null, 2));
-}
-
-// Array that manages the rooms
-const rooms = config.ROOMS
-
-const HISTORY_LIMIT = 100; // Easily changeable if moments pass. Shattered glass? Hands of time. Where's that chime?!
-/**
- * @type { Object.<string,{ username: string, message: string }[]> }
- */
 const chatHistory = {};
 
 // Initialize an empty history array for every single room
-for(const room of rooms) {
+for(const room of config.rooms) {
   chatHistory[room] = []
 }
 
-const RECENT_LIMIT = 10; // How many recent messages to replay to clients on connect
-// Ring buffer of the last few broadcast lines (stored verbatim so replay is byte-identical to a live broadcast)
-/** @type { string[] } */
-const recentMessages = [];
-
 // The amount of rooms the client should parse (calculate dynamically in the future when user-created rooms exist)
-const roomCount = rooms.length;
+const roomCount = config.rooms.length;
 
-// Client storage, keeps track of all sockets.
-const clients = [];
-
-const socket_server = net.createServer((socket) => {
-  const {ip, port} = socket.address;
-
-  const ipBan = readUsers().bannedIps.find(b => b.ip === socket.remoteAddress);
-  if (ipBan) {
-    console.log(`[${socket.remoteAddress}] IP-banned connection rejected`);
-    socket.end(`ERR_IP_BANNED|${ipBan.reason || "No reason specified"}|\n`);
-    return;
+// Get IP via proxy header if needed
+function getRealIp(req, isWs) {
+  if (isWs) {
+    real_ip = req.socket.remoteAddress;
+  } else {
+    real_ip = req.ip;
   }
-
-  console.log(`[${socket.remoteAddress}] Client connected`);
-  clients.push(socket);
-
-  // Replay recent messages so there's some permanence across reconnects
-  for(const line of recentMessages) {
-    socket.write(line);
+  if (config.using_proxy) {
+    real_ip = req.headers[config.proxy_ip_header];
   }
-
-  socket.on('data', (data) => {
-    const msg = data.toString('utf-8').trim()
-    const parts = msg.split('|')
-
-    if(parts[0] === 'history') {
-      let limit = parts[1] ? parseInt(parts[1]) : 0
-      const room = parts[2]
-      if(limit == NaN) limit = 0
-      if(limit < 0) limit = 0
-      let message = ''
-      if(room) {
-        const history = chatHistory[room]
-        if(history) 
-          for(const msg of history) {
-            message += `${msg.username}|${msg.message}|${room}|\n`
-          }
-        else {
-          console.log(`${socket.remoteAddress} requested message history for nonexistent room (${room})`)
-          return
-        }
-      } else for(const room in chatHistory) {
-        const history = chatHistory[room]
-        for(const msg of history) {
-          message += `${msg.username}|${msg.message}|${room}|\n`
-        }
-      }
-      if(limit && message.length > limit) {
-        message = message.substring(message.length - limit, message.length)
-      }
-      socket.write(message)
-      console.log(`${socket.remoteAddress} requested message history`)
-      return
-    }
-
-    console.log(`${socket.remoteAddress} tried sending data (Murder him): ${data}`);
-  });
-
-  socket.on('end', () => {
-    console.log(`[${socket.remoteAddress}] Client disconnected`);
-  });
-
-  socket.on('error', (err) => {
-    console.error(`[${socket.remoteAddress}] error: ${err.message}`);
-  });
-});
-
-// Start up the TCP server
-socket_server.listen(SOCKET_PORT, () => {
-  console.log(`AuroraTCP listening on port ${SOCKET_PORT}`);
-});
-
-// Websocket server
-const ws_server = new websocket.Server({ port: WEBSOCKET_PORT, clientTracking: true }, () => {
-  console.log(`AuroraWSS listening on port ${WEBSOCKET_PORT}`);
-});
-// WSS connection handling
-ws_server.on('connection', (ws, req) => {
-  const ipBan = readUsers().bannedIps.find(b => b.ip === req.socket.remoteAddress);
-  if (ipBan) {
-    console.log(`[${req.socket.remoteAddress}] IP-banned connection rejected`);
-    ws.send(`ERR_IP_BANNED|${ipBan.reason || "No reason specified"}|\n`);
-    ws.close();
-    return;
-  }
-
-  console.log(`[${req.socket.remoteAddress}] Client connected`);
-
-  // Replay recent messages so there's some permanence across reconnects
-  for(const line of recentMessages) {
-    ws.send(line);
-  }
-
-  ws.on('message', (data) => {
-    const msg = data.toString('utf-8').trim()
-    const parts = msg.split('|')
-
-    if(parts[0] === 'history') {
-      let limit = parts[1] ? parseInt(parts[1]) : 0
-      const room = parts[2]
-      if(limit == NaN) limit = 0
-      if(limit < 0) limit = 0
-      let message = ''
-      if(room) {
-        const history = chatHistory[room]
-        if(history) 
-          for(const msg of history) {
-            message += `${msg.username}|${msg.message}|${room}|\n`
-          }
-        else {
-          console.log(`${req.socket.remoteAddress} requested message history for nonexistent room (${room})`)
-          return
-        }
-      } else for(const room in chatHistory) {
-        const history = chatHistory[room]
-        for(const msg of history) {
-          message += `${msg.username}|${msg.message}|${room}|\n`
-        }
-      }
-      if(limit && message.length > limit) {
-        message = message.substring(message.length - limit, message.length)
-      }
-      ws.send(message)
-      console.log(`${req.socket.remoteAddress} requested message history`)
-      return
-    }
-
-    console.log(`${req.socket.remoteAddress} tried sending data (Murder him): ${data}`);
-  });
-
-  ws.on('close', (code, reason) => {
-    console.log(`[${req.socket.remoteAddress}] Client disconnected`);
-  });
-
-  ws.on('error', (err) => {
-    console.log(`[${req.socket.remoteAddress}] error: ${err.message}`);
-  });
+  return real_ip
+}
+app.use(function(req, res, next) {
+  req.real_ip = getRealIp(req, false);
+  next();
 });
 
 // Verify the JWT token provided by the client
 function verifyToken(req, res, next) {
-  const token = req.headers['auth'];
+  const token = req.headers.authorization;
 
   if (!token) {
-    console.log(`[${req.ip}]: Error: Invalid Token.`);
-    return res.send("ERR_INVALID_TOKEN");
+    console.log(`[${req.real_ip}]: Error: Invalid Token.`);
+    console.log(token)
+    return res.send({"error": "Invalid token"});
   }
 
   try {
-    const decoded = jwt.verify(token, TOKEN_SECRET);
-    req.user = decoded;
+    const decoded = jwt.verify(token, config.token_secret);
+    req.uid = decoded.id;
     next();
   } catch (err) {
-    console.log(`AHHHH OH HELP OH MY GOODNESS AHHHH ${err}`);
-    return res.send("ERR_WHAT_THE_HECK");
+    console.log(`Token error: ${err}`);
+    return res.send({"error": "Token verification error"});
   }
 }
 
 // Check if an IP is banned
-function checkBan(req, res, next) {
-  const users = readUsers();
-
-  // Straight IP ban - blocks the address regardless of which account (if any) is attached
-  const ipBan = users.bannedIps.find(b => b.ip === req.ip);
-  if (ipBan) {
-    console.log(`IP-banned address attempted access: ${req.ip}`);
-    const reason = ipBan.reason || "No reason specified";
-    return res.send(`ERR_IP_BANNED|${reason}|`);
-  }
-
-  const user = users.users.find(user => user.ip === req.ip);
-  if (user) {
-    if (user.banned == true) {
-      console.log(`Banned user attempted access: ${user.username}`);
-      const reason = user.banReason || "No reason specified";
-      return res.send(`ERR_BANNED|${reason}|`);
-    } else {
-      next();
-    }
+async function checkBan(req, res, next) {
+  result = await userdb.isIpBanned(req.real_ip);
+  if (result) {
+      console.log(`Banned user attempted access: ${result.id}`);
+      return res.send({"error": "Banned", "reason": result.reason});
   } else {
     next();
   }
 }
+app.use(checkBan);
+
+function getServerUrl() {
+  return `http${config.is_secure ? "s" : ""}://${config.host}:${config.port}/`
+}
 
 // web version
 app.use('/web', express.static('web'));
+app.get('/', (req, res) => {
+  return res.redirect("/web");
+})
 
 // Unused, simple API test
-app.post('/api/test', checkBan, (req, res) => {
-  res.set('Content-Type', 'text/plain');
-  res.status(200).send('Online');
-  console.log("Client requested API status");
+app.get('/api/test', (req, res) => {
+  res.set('Content-Type', 'application/json');
+  res.status(200).send({"result": "Online"});
+  console.log(`${req.real_ip} requested API status`);
 });
 
 // Grab rooms
-app.post('/api/rooms', checkBan, (req, res) => {
-  res.set('Content-Type', 'text/plain');
-  const responseString = `${roomCount}|${rooms.join('|')}|`;
-  res.status(200).send(responseString);
+app.get('/api/rooms', verifyToken, (req, res) => {
+  res.set('Content-Type', 'application/json');
+  res.status(200).send(config.rooms);
   console.log("Sent room list");
 });
 
-/*
-Send a message
-
-Formatting:
-message|room|
-
-Make CERTAIN it ends with a |, otherwise it'll get messy sometimes.
-*/
-app.post('/api/chat', verifyToken, checkBan, async (req, res) => {
-  const splittered = req.body.split("|");
-  if (!splittered[1] || !splittered[0]) {
-    return res.status(200).send("ERR_MISSING_FIELD");
+// {"room": "general", "content": "test", "platform": "Web", "img": "[image url]"}
+app.post('/api/chat', verifyToken, async (req, res) => {
+  var data = req.body
+  if (!config.rooms.includes(data.room)) {
+    return res.status(200).send({"error": "Room not found"});
   }
-  if (!rooms.includes(splittered[1])) {
-    return res.status(200).send("ERR_FAKE_ROOM_YOU_MORON");
-  }
-  if (splittered[1] == "announcements") {
+  if (data.room == "announcements") {
     console.log("Message in announcements:");
-    const users = readUsers();
-    const user = users.users.find(user => user.username === req.user.username);
-    if (user) {
-      if (user.admin == false) {
-        console.log("Not enough rights");
-        return res.send("ERR_NO_RIGHTS");
-      }
+    if (!(await userdb.isAdmin(req.uid))) {
+      console.log("Not enough rights");
+      return res.send({"error": "No permission"});
     }
   }
-  const users2 = readUsers();
-  const user2 = users2.users.find(user => user.username === req.user.username);
-  if (user2) {
-    if (user2.banned) {
-      const reason = user2.banReason || "No reason specified";
-      return res.status(200).send(`ERR_BANNED|${reason}|`);
-    }
-    if (user2.muted) {
-      console.log(`Muted user ${req.user.username} tried to chat.`);
-      return res.status(200).send("ERR_MUTED");
-    }
-  } else {
-    return res.status(200).send("ERR_FAKE_USER");
+  const isbanned = await userdb.isUserBanned(req.uid);
+  if (isbanned) {
+    const reason = isbanned.reason;
+    return res.status(200).send({"error": "Banned", "reason": reason});
   }
-  const username = req.user.username;
-  const now = Date.now();
-  const currentMsg = req.body.split('|')[0];
+  if (data.content.length > config.message_limit) {
+    return res.status(200).send({"error": "Message too long", "limit": config.message_limit});
+  }
+  console.log(`[${req.real_ip}] ${req.uid}: ${JSON.stringify(req.body)}`);
 
-  // 5 second cooldown between messages, per user
-  if (username !== "auroracross") {
-    const lastMsgTime = userLastMessageTime[username] || 0;
-    const sinceLast = now - lastMsgTime;
-    if (sinceLast < COOLDOWN_MS) {
-      const remaining = ((COOLDOWN_MS - sinceLast) / 1000).toFixed(1);
-      return res.status(200).send(`ERR_COOLDOWN|${remaining}|`);
-    }
-    userLastMessageTime[username] = now;
+  var censored = censor(data.content)
+  var name = (await userdb.getUser(req.uid)).username
+  var result = {
+    "author": {
+      "id": req.uid,
+      "name": name,
+      "pfp": getServerUrl()+"web/img/pfp.png" // placeholder
+    },
+    "content": censored,
+    "room": data.room,
+    "platform": data.platform,
+    "image": data.image
   }
 
-  if (!username == "auroracross") {
-    // Initialize tracking array for new users
-    if (!userMessageTimes[username]) {
-      userMessageTimes[username] = [];
-    }
-    userMessageTimes[username] = userMessageTimes[username].filter(time => now - time < 2000);
-    if (userMessageTimes[username].length >= 5) {
-      console.log(`Murdered ${username} for spamming.`);
-    
-      // Mute the user in the database/file
-      user2.muted = true;
-      writeUsers(users2);
-
-      // Clear their message log
-      delete userMessageTimes[username];
-
-      return res.status(200).send("ERR_MUTED");
-    }
-    userMessageTimes[username].push(now);
-    if (!userRecentMessages[username]) {
-      userRecentMessages[username] = [];
-    }
-
-    // Push the incoming message text
-    userRecentMessages[username].push(currentMsg);
-
-    // Keep only the last 5 messages in memory for this user
-    if (userRecentMessages[username].length > 5) {
-      userRecentMessages[username].shift();
-    }
-
-    // Check if all 5 entries in the buffer are identical
-    const isDuplicateSpam = 
-      userRecentMessages[username].length === 5 && 
-      userRecentMessages[username].every(msg => msg === currentMsg);
-
-    if (isDuplicateSpam) {
-      console.log(`Murdered ${username} for spamming. (Beta Mix)`);
-    
-      // Mute the user
-      user2.muted = true;
-      writeUsers(users2);
-
-      // Clear tracking memory for this user
-      delete userRecentMessages[username];
-      if (userMessageTimes[username]) delete userMessageTimes[username];
-
-      return res.status(200).send("ERR_MUTED");
-    }
-  }
-  
-  console.log(`[${req.ip}] ${req.user.username}: ${req.body.split('|')[0]}`);
-  console.log(`recieved:`,req.body);
-  const currentRoom = splittered[1];
-  const msgText = splittered[0];
-
-  if (chatHistory[currentRoom]) {
-    chatHistory[currentRoom].push({
-      username: req.user.username,
-      message: msgText
-    });
+  if (chatHistory[data.room]) {
+    chatHistory[data.room].push(result);
 
     // drop the oldest message if we exceed it
-    if (chatHistory[currentRoom].length > HISTORY_LIMIT) {
-      chatHistory[currentRoom].splice(0, chatHistory[currentRoom].length - HISTORY_LIMIT)
+    if (chatHistory[data.room].length > config.history_limit) {
+      chatHistory[data.room].splice(0, chatHistory[data.room].length - config.history_limit)
     }
   }
-  const matcher = new RegExpMatcher({ ...englishDataset.build(), ...englishRecommendedTransformers });
-  const censor = new TextCensor();
-  const matches = matcher.getAllMatches(`${req.user.username}|${req.body}|\n`);
-  const line = censor.applyTo(`${req.user.username}|${req.body}|\n`, matches);
-  // Cache the last few messages so we can replay them to clients on connect
-  recentMessages.push(line);
-  if (recentMessages.length > RECENT_LIMIT) {
-    recentMessages.splice(0, recentMessages.length - RECENT_LIMIT);
-  }
 
-  clients.forEach(client => {
-    client.write(line);
+  console.log("sent", JSON.stringify(result))
+  ws_server.clients.forEach(client => {
+    client.send(JSON.stringify(result));
   });
-  ws_server.clients.forEach(ws => {
-    ws.send(line);
-  });
-  return res.status(200).send("OK");
+  sendPluginData({"type": "chatmessage", "data": result})
+  return res.status(200).send({"result": "Success"});
 });
 
 
-/*
-Account Signup
+// {"username": "orstando", "password": "wowsopassword"}
+app.post('/api/signup', async (req, res) => {
+  const data = req.body
+  const username = data.username;
+  const password = data.password;
 
-Formatting:
-username|password|
-
-
-*/
-app.post('/api/signup', checkBan, async (req, res) => {
-  const splitten = req.body.split("|");
-  const username = splitten[0];
-  const password = splitten[1];
-  
   if (!username || !password) {
     console.log("Signup: missing fields");
-    return res.send("ERR_MISSING_INPUT");
+    return res.send({"error": "Missing fields"});
   }
-  if (username.length > 30) {
+  if (username.length > config.username_limit) {
     console.log("Signup: Username too long");
-    return res.send("You know, this doesn't actually have to be all caps. I can write whatever I want in here.");
+    return res.send({"error": "Username too long", "limit": config.username_limit});
   }
-  const users = readUsers();
-  if (users.users.find(user => user.username === username)) {
+  if (await userdb.doesUnameExist(username)) {
     console.log("Signup: account already in use");
-    return res.send("ERR_USER_USED");
+    return res.send({"error": "Username unavailable"});
   }
-  const matcher = new RegExpMatcher({ ...englishDataset.build(), ...englishRecommendedTransformers });
-  if (matcher.hasMatch()) {
-	console.log('Signup: Username has profanity');
-    return res.send("ERR_USER_BAD_USERNAME");
-  }
-  const hashedPassword = await bcrypt.hash(password, 10);
-  const newUser = { id: Date.now().toString(), username, password: hashedPassword, admin: false, ip: req.ip, banned: false, banReason: "", muted: false };
-  users.users.push(newUser);
-  writeUsers(users);
-
-  const token = jwt.sign({ id: newUser.id, username }, TOKEN_SECRET, { expiresIn: '1h' });
+  await userdb.createUser(username, password);
+  const newUserId = await userdb.getUIDByName(username)
+  console.log(newUserId)
+  await userdb.updateIp(newUserId, req.real_ip)
+  const token = jwt.sign({id: newUserId}, config.token_secret, { expiresIn: '1h' });
   console.log("Account created!");
-  return res.status(200).send(`${token}`);
+  return res.status(200).send({"token": token});
 });
 
-/*
-app.post('/api/signup', checkBan, async (req, res) => {
-  return res.send("Signups have been temporarily suspended.");
-});
-*/
-/*
-Account Login
+// {"username": "orstando", "password": "wowsopassword"}
+app.post('/api/login', async (req, res) => {
+  const data = req.body
+  const username = data.username;
+  const password = data.password;
 
-Formatting:
-username|password|
-
-*/
-app.post('/api/login', checkBan, async (req, res) => {
-  const splitten = req.body.split("|");
-  const username = splitten[0];
-  const password = splitten[1];
-
-  const users = readUsers();
-  const user = users.users.find(user => user.username === username);
+  const id = await userdb.getUIDByName(username);
+  const user = await userdb.getUser(id)
   if (!user || !(await bcrypt.compare(password, user.password))) {
     console.log("Wrong password");
-    return res.send("ERR_WRONG_PASS");
+    return res.send({"error": "Incorrect username or password"});
   }
 
-  if (user) {
-    if (user.banned) {
-      const reason = user.banReason || "No reason specified";
-      return res.status(200).send(`ERR_BANNED|${reason}|\n`);
-    }
-  } else {
-    return res.status(200).send("ERR_FAKE_USER");
+  const isbanned = await userdb.isUserBanned(user.id);
+  if (isbanned) {
+    const reason = isbanned.reason;
+    return res.status(200).send({"error": "Banned", "reason": reason});
   }
 
-  const token = jwt.sign({ id: user.id, username }, TOKEN_SECRET, { expiresIn: '1h' });
+  await userdb.updateIp(id, req.real_ip)
+  const token = jwt.sign({ id: user.id }, config.token_secret, { expiresIn: '1h' });
   console.log("Client logged in!");
-  return res.status(200).send(`${token}|\n`);
+  return res.status(200).send({"token": token});
 });
 
 app.use(express.urlencoded({ extended: true }));
 app.use(express.json());
 app.use(session({
-    secret: SESSION_SECRET,
+    secret: config.session_secret,
     resave: false,
     saveUninitialized: false,
-    cookie: { secure: false }
+    cookie: function (req) {
+      return {
+        path: '/',
+        httpOnly: true,
+        secure: req.secure,
+        maxAge: 3600000
+      }
+    }
 }));
+
+app.use(express.text());
 app.get('/api/rules', async (req, res) => {
-  const filePath = path.join(__dirname, 'rules.txt');
+  const filePath = path.join(__dirname, 'data', 'rules.txt');
   res.sendFile(filePath, (err) => {
       if (err) {
           console.error(err);
           if (!res.headersSent) {
-              res.status(404).send('* If you are reading this,&  I messed up somehow./%');
+              res.status(404).send('An error occurred while fetching rules.');
           }
       }
   });
 });
 app.get('/api/faq', async (req, res) => {
-  const filePath = path.join(__dirname, 'faq.txt');
+  const filePath = path.join(__dirname, 'data', 'faq.txt');
   res.sendFile(filePath, (err) => {
     if (err) {
       console.error(err);
       if (!res.headersSent) {
-        res.status(404).send('* If you are reading this,&  I messed up somehow./%');
+        res.status(404).send('An error occurred while fetching FAQ.');
       }
     }
   });
 });
 app.get('/api/changelog', async (req, res) => {
-  const filePath = path.join(__dirname, 'changelog.txt');
+  const filePath = path.join(__dirname, 'data', 'changelog.txt');
   res.sendFile(filePath, (err) => {
     if (err) {
       console.error(err);
       if (!res.headersSent) {
-        res.status(404).send('* If you are reading this,&  I messed up somehow./%');
+        res.status(404).send('An error occurred while fetching changelog.');
       }
     }
   });
 });
 
-app.post('/api/online', async (req, res) => {
-  room = req.body;
+app.use(express.json());
+
+app.get('/api/online', async (req, res) => {
+  room = req.query.room;
   // get online count for room, currently placeholder
-  res.status(200).send("?")
+  res.status(200).send({"count": 1})
 })
 
-app.get('/admin/login', async (req, res) => {
-  res.send(`
-    <form method="POST">
-        <input name="username" placeholder="Username" required />
-        <input name="password" type="password" placeholder="Password" required />
-        <button type="submit">Login</button>
-    </form>
-    `);
+app.get('/api/isadmin', async (req, res) => {
+  const id = req.query.id;
+  const result = !!userdb.isAdmin(id)
+  res.status(200).send({"result": result})
 });
-app.post('/admin/login', async (req, res) => {
-  const {username, password} = req.body;
-  const users = readUsers();
-  const user = users.admins.find(user => user.username === username);
-  if (!user || !(await bcrypt.compare(password, user.password))) {
-    console.log("Wrong password");
-    return res.status(403).send(`<p><a href="https://www.youtube.com/watch?v=dWX8Kafsc3c">Wrong password.</a></p><a href='/admin/login'>Go back</a>`);
-  }
+app.get('/api/idfromname', async (req, res) => {
+  const username = req.query.name;
+  const result = userdb.getUIDByName(username);
+  res.status(200).send({"result": result});
+})
 
-  if (!user) {
-    return res.status(403).send(`<p><a href="https://www.youtube.com/watch?v=dWX8Kafsc3c">Wrong password.</a></p><a href='/admin/login'>Go back</a>`);
-  }
-
-  req.session.admin = true;
-  if (user.staff === true) {
-    req.session.staff = true;
-  }
-
-  return res.redirect("/admin");
-});
-
-app.get('/admin', async (req, res) => {
-  if (!req.session.admin) {
-    return res.redirect("/admin/login");
-  }
-  res.send(`
-    <html>
-      <head>
-        <link rel="preconnect" href="https://fonts.googleapis.com">
-        <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-        <link rel="preload" as="style" href="https://fonts.googleapis.com/css2?family=Roboto:ital,wght@0,100..900;1,100..900&display=swap" onload="this.onload=null;this.rel='stylesheet'">
-        <noscript>
-          <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Roboto:ital,wght@0,100..900;1,100..900&display=swap">
-        </noscript>
-
-        <style>
-          h1, p, h2, a {
-            font-family: 'Roboto', Arial, sans-serif;
-          }
-        </style>
-      </head>
-      <body>
-        <h2>User Negative Actions</h2>
-        <a style='color: red;' href='/admin/mute'>Mute User</a><br>
-        <a style='color: red;' href='/admin/ban'>Ban User</a><br>
-        <a style='color: red;' href='/admin/delete'>Delete User</a><br>
-        <a style='color: darkred;' href='/admin/banip'>Ban IP</a><br>
-        <h2>User Positive Actions</h2>
-        <a style='color: green;' href='/admin/createAccount'>Create Account</a><br>
-        <a style='color: #33351c;' href='/admin/unmute'>Unmute User</a><br>
-        <a style='color: #e79b0d;' href='/admin/unban'>Unban User</a><br>
-        <a style='color: #e79b0d;' href='/admin/unbanip'>Unban IP</a><br>
-        <h2>Miscellaneous</h2>
-        <a style='color: blue;' href='/admin/userinfo'>Check User Information</a><br>
-        <a style='color: blue;' href='/admin/userswithip'>Check Users with IP</a><br>
-        <a style='color: green;' href='/admin/changebanreason'>Change User Ban Reason</a><br>
-        <a style='color: blue;' href='/admin/bannedips'>View Banned IPs</a><br>
-      </body>
-    </html>
-  `);
-});
-
-app.get('/admin/ban', async (req, res) => {
-  if (!req.session.admin) {
-    return res.redirect("/admin/login");
-  }
-  return res.send(`
-    <html>
-      <head>
-        <link rel="preconnect" href="https://fonts.googleapis.com">
-        <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-        <link rel="preload" as="style" href="https://fonts.googleapis.com/css2?family=Roboto:ital,wght@0,100..900;1,100..900&display=swap" onload="this.onload=null;this.rel='stylesheet'">
-
-        <style>
-          h1, p, h2, a {
-            font-family: 'Roboto', Arial, sans-serif;
-          }
-        </style>
-      </head>
-      <body>
-      <h1>Ban User</h1>
-      <form method="POST">
-        <input name="username" placeholder="Username to ban" required /><br><br>
-        <input name="reason" placeholder="Reason for ban" style="width: 300px;" /><br><br>
-        <button type="submit">Ban</button>
-    </form>
-    </body>
-    </html>
-  `);
-});
-
-app.post('/admin/ban', async (req, res) => {
-  if (!req.session.admin) {
-    return res.redirect("/admin/login");
-  }
-  const {username, reason} = req.body;
-  const users = readUsers();
-  const user = users.users.find(user => user.username === username);
-  if (user) {
-    user.banned = true;
-    user.banReason = reason || "No reason specified";
-  }
-  writeUsers(users);
-
-  return res.send(`
-    <p>User banned!</p>
-    <p>Reason: ${reason || "No reason specified"}</p>
-    <a href="/admin">Go back</a>
-    `);
-});
-app.get('/admin/unban', async (req, res) => {
-  if (!req.session.admin) {
-    return res.redirect("/admin/login");
-  }
-  return res.send(`
-    <html>
-      <head>
-        <link rel="preconnect" href="https://fonts.googleapis.com">
-        <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-        <link rel="preload" as="style" href="https://fonts.googleapis.com/css2?family=Roboto:ital,wght@0,100..900;1,100..900&display=swap" onload="this.onload=null;this.rel='stylesheet'">
-
-        <style>
-          h1, p, h2, a {
-            font-family: 'Roboto', Arial, sans-serif;
-          }
-        </style>
-      </head>
-      <body>
-      <h1>Unban User</h1>
-      <form method="POST">
-        <input name="username" placeholder="Username to unban" /><br>
-        <button type="submit">Unban</button>
-    </form>
-    </body>
-    </html>
-  `);
-});
-
-app.post('/admin/unban', async (req, res) => {
-  if (!req.session.admin) {
-    return res.redirect("/admin/login");
-  }
-  const {username} = req.body;
-  const users = readUsers();
-  const user = users.users.find(user => user.username === username);
-  if (user) {
-    user.banned = false;
-    user.banReason = "";
-  }
-  writeUsers(users);
-
-  return res.send(`
-    <p>User unbanned!</p>
-    <a href="/admin">Go back</a>
-    `);
-});
-
-app.get('/admin/banip', async (req, res) => {
-  if (!req.session.admin) {
-    return res.redirect("/admin/login");
-  }
-  return res.send(`
-    <html>
-      <head>
-        <link rel="preconnect" href="https://fonts.googleapis.com">
-        <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-        <link rel="preload" as="style" href="https://fonts.googleapis.com/css2?family=Roboto:ital,wght@0,100..900;1,100..900&display=swap" onload="this.onload=null;this.rel='stylesheet'">
-
-        <style>
-          h1, p, h2, a {
-            font-family: 'Roboto', Arial, sans-serif;
-          }
-        </style>
-      </head>
-      <body>
-      <h1>IP Ban</h1>
-      <form method="POST">
-        <input name="ip" placeholder="IP to ban" required /><br><br>
-        <input name="reason" placeholder="Reason for ban" style="width: 300px;" /><br><br>
-        <button type="submit">Ban IP</button>
-    </form>
-    </body>
-    </html>
-  `);
-});
-
-app.post('/admin/banip', async (req, res) => {
-  if (!req.session.admin) {
-    return res.redirect("/admin/login");
-  }
-  const {ip, reason} = req.body;
-  if (!ip) {
-    return res.send(`
-      <p>You need to include an IP.</p>
-      <a href="/admin/banip">Go back</a>
-      `);
-  }
-  const users = readUsers();
-  const existing = users.bannedIps.find(b => b.ip === ip);
-  if (existing) {
-    existing.reason = reason || "No reason specified";
-  } else {
-    users.bannedIps.push({ ip, reason: reason || "No reason specified" });
-  }
-  writeUsers(users);
-
-  return res.send(`
-    <p>IP banned!</p>
-    <p>IP: ${ip}</p>
-    <p>Reason: ${reason || "No reason specified"}</p>
-    <a href="/admin">Go back</a>
-    `);
-});
-
-app.get('/admin/unbanip', async (req, res) => {
-  if (!req.session.admin) {
-    return res.redirect("/admin/login");
-  }
-  return res.send(`
-    <html>
-      <head>
-        <link rel="preconnect" href="https://fonts.googleapis.com">
-        <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-        <link rel="preload" as="style" href="https://fonts.googleapis.com/css2?family=Roboto:ital,wght@0,100..900;1,100..900&display=swap" onload="this.onload=null;this.rel='stylesheet'">
-
-        <style>
-          h1, p, h2, a {
-            font-family: 'Roboto', Arial, sans-serif;
-          }
-        </style>
-      </head>
-      <body>
-      <h1>Unban IP</h1>
-      <form method="POST">
-        <input name="ip" placeholder="IP to unban" required /><br>
-        <button type="submit">Unban IP</button>
-    </form>
-    </body>
-    </html>
-  `);
-});
-
-app.post('/admin/unbanip', async (req, res) => {
-  if (!req.session.admin) {
-    return res.redirect("/admin/login");
-  }
-  const {ip} = req.body;
-  const users = readUsers();
-  users.bannedIps = users.bannedIps.filter(b => b.ip !== ip);
-  writeUsers(users);
-
-  return res.send(`
-    <p>IP unbanned!</p>
-    <a href="/admin">Go back</a>
-    `);
-});
-
-app.get('/admin/bannedips', async (req, res) => {
-  if (!req.session.admin) {
-    return res.redirect("/admin/login");
-  }
-  const users = readUsers();
-  const rowsHtml = users.bannedIps.length
-    ? users.bannedIps.map(b => `<p>${b.ip} &mdash; ${b.reason || "No reason specified"}</p>`).join("\n")
-    : "<p>No IPs currently banned.</p>";
-
-  return res.send(`
-    <html>
-      <head>
-        <link rel="preconnect" href="https://fonts.googleapis.com">
-        <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-        <link rel="preload" as="style" href="https://fonts.googleapis.com/css2?family=Roboto:ital,wght@0,100..900;1,100..900&display=swap" onload="this.onload=null;this.rel='stylesheet'">
-
-        <style>
-          h1, p, h2, a {
-            font-family: 'Roboto', Arial, sans-serif;
-          }
-        </style>
-      </head>
-      <body>
-      <h1>Banned IPs</h1>
-      ${rowsHtml}
-      <a href="/admin">Go back</a>
-    </body>
-    </html>
-  `);
-});
-
-app.get('/admin/delete', async (req, res) => {
-  if (!req.session.admin) {
-    return res.redirect("/admin/login");
-  }
-  return res.send(`
-    <html>
-      <head>
-        <link rel="preconnect" href="https://fonts.googleapis.com">
-        <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-        <link rel="preload" as="style" href="https://fonts.googleapis.com/css2?family=Roboto:ital,wght@0,100..900;1,100..900&display=swap" onload="this.onload=null;this.rel='stylesheet'">
-
-        <style>
-          h1, p, h2, a {
-            font-family: 'Roboto', Arial, sans-serif;
-          }
-        </style>
-      </head>
-      <body>
-      <h1 style='color: red;'>Delete User</h1>
-      <form method="POST">
-        <input name="username" placeholder="Username to murder in real life" /><br>
-        <button type="submit">Send hitmen</button>
-    </form>
-    </body>
-    </html>
-  `);
-});
-
-app.post('/admin/delete', async (req, res) => {
-  if (!req.session.admin) {
-    return res.redirect("/admin/login");
-  }
-  const {username} = req.body;
-  const users = readUsers();
-  users.users = users.users.filter(user => user.username !== username);
-  writeUsers(users);
-
-  return res.send(`
-    <p>User deleted!</p>
-    <a href="/admin">Go back</a>
-    `);
-});
-app.get('/admin/mute', async (req, res) => {
-  if (!req.session.admin) {
-    return res.redirect("/admin/login");
-  }
-  return res.send(`
-    <html>
-      <head>
-        <link rel="preconnect" href="https://fonts.googleapis.com">
-        <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-        <link rel="preload" as="style" href="https://fonts.googleapis.com/css2?family=Roboto:ital,wght@0,100..900;1,100..900&display=swap" onload="this.onload=null;this.rel='stylesheet'">
-
-        <style>
-          h1, p, h2, a {
-            font-family: 'Roboto', Arial, sans-serif;
-          }
-        </style>
-      </head>
-      <body>
-      <h1 style='color: red;'>Mute User</h1>
-      <form method="POST">
-        <input name="username" placeholder="Username to mute" /><br>
-        <button type="submit">Mute user</button>
-    </form>
-    </body>
-    </html>
-  `);
-});
-
-app.post('/admin/mute', async (req, res) => {
-  if (!req.session.admin) {
-    return res.redirect("/admin/login");
-  }
-  const { username } = req.body;
-  const users = readUsers();
-  const user = users.users.find(user => user.username === username);
-  
-  // Commit the mute to the database
-  if (user) {
-    user.muted = true;
-    writeUsers(users);
-  }
-
-  return res.send(`
-    <p>User Where... Where am I? Hello...? Anyone...? Is... is anybody out there...? Someone!? Anyone!? Can anyone hear me!? ... It's dark. It's so dark here. Someone, anyone, if you can hear me... Say something... please...</p>
-    <a href="/admin">Go back</a>
-    `);
-});
-app.get('/admin/unmute', async (req, res) => {
-  if (!req.session.admin) {
-    return res.redirect("/admin/login");
-  }
-  return res.send(`
-    <html>
-      <head>
-        <link rel="preconnect" href="https://fonts.googleapis.com">
-        <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-        <link rel="preload" as="style" href="https://fonts.googleapis.com/css2?family=Roboto:ital,wght@0,100..900;1,100..900&display=swap" onload="this.onload=null;this.rel='stylesheet'">
-
-        <style>
-          h1, p, h2, a {
-            font-family: 'Roboto', Arial, sans-serif;
-          }
-        </style>
-      </head>
-      <body>
-      <h1 style='color: green;'>Unmute User</h1>
-      <form method="POST">
-        <input name="username" placeholder="Username to unmute" /><br>
-        <button type="submit">Unmute user</button>
-    </form>
-    </body>
-    </html>
-  `);
-});
-
-app.post('/admin/unmute', async (req, res) => {
-  if (!req.session.admin) {
-    return res.redirect("/admin/login");
-  }
-  const { username } = req.body;
-  const users = readUsers();
-  const user = users.users.find(user => user.username === username);
-  
-  if (user) {
-    user.muted = false;
-    writeUsers(users);
-  }
-
-
-  return res.send(`
-    <p>User unmuted!</p>
-    <a href="/admin">Go back</a>
-    `);
-});
-
-app.get('/admin/createAccount', async (req, res) => {
-  if (!req.session.admin) {
-    return res.redirect("/admin/login");
-  }
-  return res.send(`
-    <html>
-      <head>
-        <link rel="preconnect" href="https://fonts.googleapis.com">
-        <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-        <link rel="preload" as="style" href="https://fonts.googleapis.com/css2?family=Roboto:ital,wght@0,100..900;1,100..900&display=swap" onload="this.onload=null;this.rel='stylesheet'">
-
-        <style>
-          h1, p, h2, a {
-            font-family: 'Roboto', Arial, sans-serif;
-          }
-        </style>
-      </head>
-      <body>
-      <h1 style='color: green;'>Create User</h1>
-      <form method="POST">
-        <input name="username" placeholder="Username" required /><br>
-        <input name="password" placeholder="Password" /><br>
-        <input name="passwordHash" placeholder="Password Hash" /><br>
-        <button type="submit">Create Account</button>
-    </form>
-    </body>
-    </html>
-  `);
-});
-
-app.post('/admin/createAccount', async (req, res) => {
-  if (!req.session.admin) {
-    return res.redirect("/admin/login");
-  }
-  const {username, password, passwordHash} = req.body;
-  
-
-  const users = readUsers();
-  if (users.users.find(user => user.username === username)) {
-    console.log("Signup: account already in use");
-    return res.status(409).send("ERR_USER_USED");
-  }
-
-  var hashedPassword;
-  if (!passwordHash) {
-    hashedPassword = await bcrypt.hash(password, 10);
-  } else if (!password) {
-    hashedPassword = passwordHash
-  } else {
-      return res.send(`
-        <p>You need to at least include a password or a password hash.</p>
-        <a href="/admin">Go back</a>
-        `);
-  }
-  
-  const newUser = { id: Date.now().toString(), username, password: hashedPassword, admin: false, ip: req.ip, banned: false, banReason: "", muted: false };
-  users.users.push(newUser);
-  writeUsers(users);
-
-  return res.send(`
-    <p>User created!</p>
-    <a href="/admin">Go back</a>
-    `);
-});
-
-app.get('/admin/userinfo', async (req, res) => {
-  if (!req.session.admin) {
-    return res.redirect("/admin/login");
-  }
-  return res.send(`
-    <html>
-      <head>
-        <link rel="preconnect" href="https://fonts.googleapis.com">
-        <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-        <link rel="preload" as="style" href="https://fonts.googleapis.com/css2?family=Roboto:ital,wght@0,100..900;1,100..900&display=swap" onload="this.onload=null;this.rel='stylesheet'">
-
-        <style>
-          h1, p, h2, a {
-            font-family: 'Roboto', Arial, sans-serif;
-          }
-        </style>
-      </head>
-      <body>
-      <h1 style='color: green;'>Check User Information</h1>
-      <form method="POST">
-        <input name="username" placeholder="Username" required /><br>
-        <button type="submit">Grab Info</button>
-    </form>
-    </body>
-    </html>
-  `);
-});
-
-app.post('/admin/userinfo', async (req, res) => {
-  if (!req.session.admin) {
-    return res.redirect("/admin/login");
-  }
-  const {username} = req.body;
-  
-  const users = readUsers();
-  const user = users.users.find(user => user.username === username);
-
-  return res.send(`
-    <p>Username: ${user.username}<br>Password Hash: ${user.password}<br>ID: ${user.id}<br>Banned: ${user.banned}<br>Ban Reason: ${user.banReason || "None"}<br>Muted: ${user.muted}<br>IP: <a href="#" onclick="return postName(this)">${user.ip}</a></p>
-    <a href="/admin">Go back</a>
-    <script>
-    // are you gonna finish that croissant?
-    function postName(el) {
-        const form = document.createElement('form');
-        form.method = 'POST';
-        form.action = '/admin/userswithip';
-
-        const input = document.createElement('input');
-        input.type = 'hidden';
-        input.name = 'ip';
-        input.value = '${user.ip}';
-
-        form.appendChild(input);
-        document.body.appendChild(form);
-        form.submit();
-
-        return false;
+app.get('/api/history', verifyToken, async (req, res) => {
+  const room = req.query.room;
+  let messages = []
+  if(room) {
+    const history = chatHistory[room]
+    if(history) {
+      for(const msg of history) {
+        messages.push(msg);
+      }
     }
-    </script>
-    `);
-});
-app.post('/api/isadmin', async (req, res) => {
-  const {username} = req.body;
-  
-  const users = readUsers();
-  const user = users.users.find(user => user.username === username);
-  if (!user) {
-    return res.status(404).send("Invalid user yo");
+  } else {
+    console.log(`${req.real_ip} requested message history for nonexistent room (${data.room})`)
+    return res.status(404).send({
+      "error": "Room not found"
+    });
   }
-  res.status(200).send(`${user.admin}`)
-});
+  res.status(200).send(messages)
+  console.log(`${req.real_ip} requested message history`)
+  return
+})
 
-app.get('/admin/userswithip', async (req, res) => {
-  if (!req.session.admin) {
-    return res.redirect("/admin/login");
-  }
-  return res.send(`
-    <html>
-      <head>
-        <link rel="preconnect" href="https://fonts.googleapis.com">
-        <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-        <link rel="preload" as="style" href="https://fonts.googleapis.com/css2?family=Roboto:ital,wght@0,100..900;1,100..900&display=swap" onload="this.onload=null;this.rel='stylesheet'">
+app.use("/admin", admin); // admin panel
 
-        <style>
-          h1, p, h2, a {
-            font-family: 'Roboto', Arial, sans-serif;
-          }
-        </style>
-      </head>
-      <body>
-      <h1 style='color: green;'>Check Users with IP</h1>
-      <form method="POST">
-        <input name="ip" placeholder="IP" required /><br>
-        <button type="submit">Grab Users</button>
-    </form>
-    </body>
-    </html>
-  `);
+server = app.listen(config.port, '0.0.0.0', () => {
+  console.log(`Chatterbox running on port ${config.port}`);
 });
 
-app.post('/admin/userswithip', async (req, res) => {
-  if (!req.session.admin) {
-    return res.redirect("/admin/login");
-  }
-  const {ip} = req.body;
-  
-  const users = readUsers()["users"];
-  const matches = users.filter(item => item.ip === ip).map(item => item.username);
-  const usernamesHtml = matches.map(username => `<a href="#" onclick="return postName(this)"><p>${username}</p></a>`).join("\n");
+// Websocket server
+ws_server = new websocket.Server({ server: server, clientTracking: true });
+// WSS connection handling
+ws_server.on('connection', (ws, req) => {
+  var real_ip = getRealIp(req, true)
+  console.log(`[${real_ip}] Client connected`);
 
-  return res.send(`
-    ${usernamesHtml}
-    <a href="/admin">Go back</a>
-    <script>
-    // NOTE: this is some bullshit i have to use to make the actual "clickable username" thing work. - 3pm
-    function postName(el) {
-        const username = el.textContent.trim();
+  ws.on('message', (data) => {
+    console.log(`${real_ip} tried sending data: ${data}`);
+  });
 
-        const form = document.createElement('form');
-        form.method = 'POST';
-        form.action = '/admin/userinfo';
+  ws.on('close', (code, reason) => {
+    console.log(`[${real_ip}] Client disconnected`);
+  });
 
-        const input = document.createElement('input');
-        input.type = 'hidden';
-        input.name = 'username';
-        input.value = username;
-
-        form.appendChild(input);
-        document.body.appendChild(form);
-        form.submit();
-
-        return false;
-    }
-    </script>
-    `);
-});
-
-app.get('/admin/changebanreason', async (req, res) => {
-  if (!req.session.admin) {
-    return res.redirect("/admin/login");
-  }
-  return res.send(`
-    <html>
-      <head>
-        <link rel="preconnect" href="https://fonts.googleapis.com">
-        <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-        <link rel="preload" as="style" href="https://fonts.googleapis.com/css2?family=Roboto:ital,wght@0,100..900;1,100..900&display=swap" onload="this.onload=null;this.rel='stylesheet'">
-
-        <style>
-          h1, p, h2, a {
-            font-family: 'Roboto', Arial, sans-serif;
-          }
-        </style>
-      </head>
-      <body>
-      <h1 style='color: green;'>Change User Ban Reason</h1>
-      <form method="POST">
-        <input name="username" placeholder="Username" required /><br>
-        <input name="reason" placeholder="New Ban Reason" required /><br>
-        <button type="submit">Change Ban Reason</button>
-    </form>
-    </body>
-    </html>
-  `);
-});
-
-app.post('/admin/changebanreason', async (req, res) => {
-  if (!req.session.admin) {
-    return res.redirect("/admin/login");
-  }
-  const {username, reason} = req.body;
-  const users = readUsers();
-  const user = users.users.find(user => user.username === username);
-  if (user) {
-    user.banReason = reason || "No reason specified";
-  }
-  writeUsers(users);
-
-  return res.send(`
-    <p>Changed user ban reason!</p>
-    <p>Reason: ${reason || "No reason specified"}</p>
-    <a href="/admin">Go back</a>
-    `);
-});
-
-app.listen(HTTP_PORT, () => {
-  console.log(`AuroraHTTP running on port ${HTTP_PORT}`);
+  ws.on('error', (err) => {
+    console.log(`[${real_ip}] error: ${err.message}`);
+  });
 });
